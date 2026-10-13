@@ -39,5 +39,5 @@ Bars outlive each `code_execution` script and clear when the turn ends.
 
 `color` takes a name from a built-in swatch list (`red`, `cyan`, ...). On
 maki builds that expose `maki.ui.get_theme_palette`, the running theme's
-palette is offered first. The list (`swatches`) is bundled with this
-package.
+palette is offered first. The list is vendored from
+[maki-swatches](https://github.com/amirs-maki-plugins/maki-swatches).
