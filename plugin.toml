@@ -1,1 +1,4 @@
 min_maki_version = "0.5.3"
+
+[permissions]
+session_read = true
