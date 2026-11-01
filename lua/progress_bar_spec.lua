@@ -309,4 +309,34 @@ cases.short_text_truncates_to_the_cell_budget = function(check)
   check.eq(t.short_text("a-very-long-task-name", 8), "a-very-…")
 end
 
+cases.turn_end_keeps_a_running_tasks_bars = function(check)
+  fresh({ value = 1, total = 2 })
+  t.task_status["spec"] = "working"
+  check.eq(t.drop_dead_tasks("spec-session"), false, "a working task keeps its bars")
+  check.is(state(key) ~= nil, true, "the bar is still there")
+  t.task_status["spec"] = "idle"
+  check.eq(t.drop_dead_tasks("spec-session"), false, "an idle plugin task is still alive")
+  t.task_status["spec"] = nil
+  check.eq(t.drop_dead_tasks("spec-session"), true, "a task no event named is dead")
+  check.eq(state(key), nil, "the main chat's bars clear with the turn")
+end
+
+cases.terminal_status_clears_the_tasks_bars = function(check)
+  fresh({ value = 1, total = 2 })
+  t.task_status["spec"] = "done"
+  check.eq(t.task_live("spec"), false, "done is terminal")
+  check.eq(t.clear_task_bars("spec"), true)
+  check.eq(state(key), nil)
+  t.task_status["spec"] = nil
+end
+
+cases.clear_task_bars_sweeps_every_session = function(check)
+  fresh({ value = 1, total = 2 })
+  t.apply({ session = "spec-other", task = "spec" }, { value = 1, total = 2 })
+  check.eq(t.clear_task_bars("spec"), true)
+  check.eq(state(key), nil)
+  check.eq(t.current_state({ session = "spec-other", task = "spec" }), nil)
+  check.eq(t.clear_task_bars("spec"), false, "nothing left to drop")
+end
+
 return { cases = cases, name = "progress_bar" }

@@ -17,8 +17,8 @@
 --
 -- The bars outlive the script: state persists across code_execution runs in
 -- the same turn, so a later script resumes a bar with `value` alone. The
--- turn's end is the destructor — it clears every bar the turn left, so the
--- agent must keep polling inside the turn while the user watches the bars.
+-- turn's end clears what the turn left behind, except the bars of background
+-- tasks still running: those clear when the task itself ends.
 --
 -- The Lua side holds state only. Every call goes through the same apply()
 -- path, so repeated calls with the same value are cheap and a script
@@ -78,6 +78,53 @@ local seq = 0
 -- task id -> display name, from TaskStatusChanged, seeded from
 -- maki.task.list() when a bar names a task no event arrived for.
 local task_names = {}
+-- task id -> last status TaskStatusChanged reported. "working" and
+-- "idle" mean the task is still alive, so its bars outlive the turn that
+-- spawned it. The main chat never appears here, so it always counts as
+-- dead: its bars are the turn's own and clear with the turn.
+local task_status = {}
+
+local function task_live(id)
+  local s = task_status[id]
+  return s == "working" or s == "idle"
+end
+
+-- Drop the bars of every task that is not alive anymore. A task no event
+-- ever named (the main chat, or one that opened and stopped within a
+-- frame) counts as dead, so a turn's end still clears what it left.
+local function drop_dead_tasks(sid)
+  local session_tasks = states[sid]
+  if not session_tasks then
+    return false
+  end
+  local dropped = false
+  for tid in pairs(session_tasks) do
+    if not task_live(tid) then
+      session_tasks[tid] = nil
+      dropped = true
+    end
+  end
+  if not next(session_tasks) then
+    states[sid] = nil
+  end
+  return dropped
+end
+
+-- A task's bars can sit under any session key (the status event carries
+-- no session id), so sweep them all.
+local function clear_task_bars(tid)
+  local dropped = false
+  for sid, session_tasks in pairs(states) do
+    if session_tasks[tid] then
+      session_tasks[tid] = nil
+      dropped = true
+      if not next(session_tasks) then
+        states[sid] = nil
+      end
+    end
+  end
+  return dropped
+end
 
 local function sanitize(s)
   if type(s) ~= "string" then
@@ -506,7 +553,7 @@ Rules:
 - A fresh bar needs `value` and `total` together. On later calls pass only what changed.
 - `name` identifies a bar: the same name updates the same bar, a new name opens another (at most 6 per task). Omit it for the unnamed default bar — the shape of every single-bar example above. A named bar is only ever touched by calls that repeat its `name`.
 - The bars outlive the script: they stay on screen after code_execution ends and their state persists, so the next script in the same turn resumes them with `value` alone (plus `name` for a named bar). Keep updating them while work continues across scripts. Do not re-send `value` and `total` to resume: a value below a bar's current count reads as a restarted run and resets its elapsed time and note.
-- The turn's end clears every bar automatically, so ending your turn (sending a final reply) removes the bars even though the work is still running. If the user wants to watch the bars, do not end the turn: keep polling with consecutive code_execution calls (each loop at most a few minutes, a bash sleep between rounds) until the work is done, then reply. A bar cleared this way needs value and total again on its next call. Within a turn, `action='clear'` removes bars early: with `name`, that one bar; without, every bar the task owns. A finished bar left at 100% is also fine.
+- The turn's end clears every bar the turn left automatically, so ending your turn (sending a final reply) removes the main chat's bars. Bars a background task you spawned still updates are the exception: they stay on screen while the task runs and clear when it finishes, so a bar-owning background task may end its turn freely. Within a turn, `action='clear'` removes bars early: with `name`, that one bar; without, every bar the task owns. A finished bar left at 100% is also fine.
 - The bars are visible to the user immediately. Do NOT call more often than your polling loop already runs, and make sure the loop actually waits between iterations — calls from a delay-free loop churn the bar for nothing.
 - `color` sets the fill color: a name from the shared swatch list (the same names /color offers, e.g. 'red', 'cyan'; hex is not accepted). A name not in the list falls back to the theme's in-progress style. A bar created without a color while other bars exist picks a random unused theme color first, then a random unused swatch from the rest, so a stack of bars stays distinguishable.
 - Panel stacking verified: the bars (order=20) sit below the todo panel (order=10), both above the input separator.
@@ -593,18 +640,23 @@ maki.api.create_autocmd("TurnStart", {
   callback = function(ev)
     -- A session that loads mid-turn (reload during a run) gets no TurnEnd
     -- for the turn that was live before it, so drop anything a restored
-    -- state table left behind when the next turn starts.
-    if states[ev.data.session_id] then
-      states[ev.data.session_id] = nil
-    end
+    -- state table left behind when the next turn starts. A background
+    -- task still alive after the reload keeps its bars.
+    drop_dead_tasks(ev.data.session_id)
   end,
 })
 
--- Subagents run inside the parent's turn, so its end clears their bars too.
+-- A turn's end clears the bars of everything that ran inside it, the
+-- main chat and its inline subagents. A background task the turn
+-- detached is still "working" or "idle", so its bars stay on screen; the
+-- task's own end clears them. A reset or a closed session takes all of
+-- them, running or not.
 maki.api.create_autocmd({ "TurnEnd", "SessionReset", "SessionEnd" }, {
   callback = function(ev)
     local sid = ev.data and ev.data.session_id or ""
-    if states[sid] then
+    if ev.event == "TurnEnd" then
+      drop_dead_tasks(sid)
+    else
       states[sid] = nil
     end
     if sid == focused.session then
@@ -614,12 +666,36 @@ maki.api.create_autocmd({ "TurnEnd", "SessionReset", "SessionEnd" }, {
 })
 
 -- A subagent's name labels its block; the event that announces the task
--- also names it, so the render needs no extra roundtrip.
+-- also names it, so the render needs no extra roundtrip. A terminal
+-- status is the destructor for a background task's bars: nothing else
+-- will clear them once the turn that spawned them is gone.
 maki.api.create_autocmd("TaskStatusChanged", {
   callback = function(ev)
     local d = ev.data or {}
-    if d.id and d.name and d.name ~= "" then
+    if not d.id then
+      return
+    end
+    if d.name and d.name ~= "" then
       task_names[d.id] = d.name
+    end
+    task_status[d.id] = d.status
+    local s = d.status
+    if s == "done" or s == "error" or s == "cancelled" then
+      if clear_task_bars(d.id) then
+        sync()
+      end
+    end
+  end,
+})
+
+-- TaskStopped never misses (TaskStatusChanged can, when a task opens and
+-- stops within one frame), so it backs the status event up as the
+-- destructor for a stopped task's bars.
+maki.api.create_autocmd("TaskStopped", {
+  callback = function(ev)
+    local id = ev.data and ev.data.id
+    if id and clear_task_bars(id) then
+      sync()
     end
   end,
 })
@@ -645,6 +721,10 @@ return {
     sanitize = sanitize,
     to_count = to_count,
     tasks_with_bars = tasks_with_bars,
+    task_live = task_live,
+    drop_dead_tasks = drop_dead_tasks,
+    clear_task_bars = clear_task_bars,
+    task_status = task_status,
     short_text = short_text,
     auto_color = auto_color,
     percent = percent,
