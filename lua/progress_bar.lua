@@ -229,14 +229,18 @@ local function render()
     -- A panel row sits directly above the queue panel and the input box
     -- separator, and the layout engine keeps it there as the box grows,
     -- which a fixed SW float cannot.
-    win = maki.ui.open_win(buf, {
+    local wopts = {
       split = "panel",
       height = 1,
       order = 20,
       border = "none",
       focus = false,
       visible = false,
-    })
+    }
+    if focused.session ~= "" then
+      wopts.session = focused.session
+    end
+    win = maki.ui.open_win(buf, wopts)
   end
 
   local now = os.time()

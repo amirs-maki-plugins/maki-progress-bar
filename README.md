@@ -19,7 +19,7 @@ maki.pack.add({
 })
 ```
 
-Requires maki 0.5.3 or newer. Update with `/packupdate maki-progress-bar`.
+Requires maki 0.7.0 or newer. Update with `/packupdate maki-progress-bar`.
 
 ## Use
 

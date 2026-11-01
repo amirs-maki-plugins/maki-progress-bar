@@ -3,10 +3,9 @@
 -- `color` option. One list, so both always offer the same colors.
 --
 -- The list is the canonical SWATCHES below; the running theme's palette
--- (maki.ui.get_theme_palette) is layered on top when the build has it —
--- it is an unmerged feature, so on upstream maki the SWATCHES alone are
--- the list. Entries that share one hex merge into one row labeled with
--- every name. resolve() maps any name — merged labels included — to its
+-- (maki.ui.get_theme_palette) is layered on top, so a picker offers the
+-- theme's own colors first. Entries that share one hex merge into one row
+-- labeled with every name. resolve() maps any name — merged labels included — to its
 -- hex, so a caller paints with the hex directly and never depends on the
 -- theme resolving the name.
 
