@@ -283,4 +283,30 @@ cases.auto_color_prefers_theme = function(check)
   end
 end
 
+cases.blocks_list_every_task_with_bars = function(check)
+  local s = "spec-blocks"
+  t.apply({ session = s, task = "main" }, { label = "a", value = 1, total = 2 })
+  t.apply({ session = s, task = "sub1" }, { label = "b", value = 1, total = 2 })
+  t.apply({ session = s, task = "empty" }, { label = "c", value = 1, total = 2 })
+  t.apply({ session = s, task = "empty" }, { action = "clear" })
+  local ids = t.tasks_with_bars(s)
+  check.eq(#ids, 2, "a task with no bars shows no block")
+  check.eq(ids[1], "main", "the main chat comes first")
+  check.eq(ids[2], "sub1")
+end
+
+cases.blocks_order_follows_creation_without_the_focused_task = function(check)
+  local s = "spec-order"
+  t.apply({ session = s, task = "sub2" }, { value = 1, total = 2 })
+  t.apply({ session = s, task = "sub1" }, { value = 1, total = 2 })
+  local ids = t.tasks_with_bars(s)
+  check.eq(ids[1], "sub2", "creation order, not name order")
+  check.eq(ids[2], "sub1")
+end
+
+cases.short_text_truncates_to_the_cell_budget = function(check)
+  check.eq(t.short_text("short", 10), "short")
+  check.eq(t.short_text("a-very-long-task-name", 8), "a-very-…")
+end
+
 return { cases = cases, name = "progress_bar" }

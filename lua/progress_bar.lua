@@ -1,9 +1,11 @@
 -- progress_bar: live status bars above the input box separator that a
 -- long-running script can update from inside code_execution.
 --
--- Layout (one line per bar):
+-- Layout (one line per bar, one block per task):
 --   build   ████████░░░░░░░░░░  412/1000 requests  41%  2m03s
 --   check   ██░░░░░░░░░░░░░░░░   18/200   files    9%  0m41s
+--   tests  load   █████░░░░░░░    30/100  chunks  30%  0m12s
+--          save   ██░░░░░░░░░░     2/10   files   20%  0m03s
 --
 -- In code_execution:
 --   await progress_bar(label='build', value=0, total=1000, note='requests')
@@ -27,6 +29,7 @@ local FILL, EMPTY = "█", "░"
 local MAIN_TASK = "main"
 local DEFAULT_NAME = ""
 local MAX_BARS = 6
+local MAX_TASK_CELLS = 14
 local DEFAULT_COLOR = "todo_in_progress"
 local swatches = require("swatches")
 
@@ -70,11 +73,11 @@ end
 -- unnamed bar keeps the old single-bar call shape working.
 local states = {}
 local focused = { session = "", task = MAIN_TASK }
--- The task last updated in the focused session, shown while the user
--- watches a chat whose own bars are idle (a subagent running the test).
-local fallback = {}
 local buf, win
 local seq = 0
+-- task id -> display name, from TaskStatusChanged, seeded from
+-- maki.task.list() when a bar names a task no event arrived for.
+local task_names = {}
 
 local function sanitize(s)
   if type(s) ~= "string" then
@@ -170,16 +173,17 @@ end
 
 -- `wait` without `stalled`: the bar repaints on every call, and a script
 -- that polls pushes a call per iteration, so no timer is needed on the Lua
--- side to keep it current. `w` is the shared column widths from render();
--- without it the bar aligns to itself.
-local function render_state(st, now, w)
+-- side to keep it current. `w` is the shared column widths from render()
+-- and `left` the cells the task-title column takes, both nil when the bar
+-- renders alone.
+local function render_state(st, now, w, left)
   local value = st.value or 0
   local total = st.total or value
   local ratio = total > 0 and math.min(value / total, 1) or 0
 
   local c = columns(st, now)
   w = w or column_widths({ st }, now)
-  local cols = maki.ui.terminal_size().cols
+  local cols = maki.ui.terminal_size().cols - (left or 0)
   local width = math.max(math.min(cols - fixed_width(st, now, w), math.floor(cols / 2)), 10)
   local filled = math.floor(ratio * width + 0.5)
 
@@ -204,20 +208,80 @@ local function render_state(st, now, w)
   return { spans }
 end
 
--- Rebuilt from the focused states (fallback included) on every change: one
--- line per bar, in creation order, all bars at the same width so the
--- columns line up. set_lines repaints the panel through its waker,
--- set_config rows it to the line count.
-local function render()
-  local sid = focused.session
-  local list = bars_of(focused)
-  if not list then
-    local fb = fallback[sid]
-    if fb then
-      list = bars_of({ session = sid, task = fb.task })
+-- One block per task of the focused session that holds bars: the focused
+-- task first, the rest in creation order. The main chat gets no title; a
+-- subagent's name sits left of its first bar, so a bar a background task
+-- left stays readable while the user watches another chat.
+local function tasks_with_bars(sid)
+  local session_states = states[sid] or {}
+  local ids = {}
+  for task_id, bars in pairs(session_states) do
+    if next(bars) then
+      ids[#ids + 1] = task_id
     end
   end
-  if not list then
+  local first_seq = function(task_id)
+    local m = math.huge
+    for _, st in pairs(session_states[task_id]) do
+      m = math.min(m, st.seq)
+    end
+    return m
+  end
+  table.sort(ids, function(a, b)
+    if a == focused.task then
+      return b ~= focused.task
+    end
+    if b == focused.task then
+      return false
+    end
+    return first_seq(a) < first_seq(b)
+  end)
+  return ids
+end
+
+local function short_text(text, max)
+  if dw(text) <= max then
+    return text
+  end
+  local cut, w, i = 0, 0, 1
+  while i <= #text do
+    local b = text:byte(i)
+    local cl = b >= 0xF0 and 4 or b >= 0xE0 and 3 or b >= 0xC0 and 2 or 1
+    local cw = dw(text:sub(i, i + cl - 1))
+    if w + cw > max - 1 then
+      break
+    end
+    w = w + cw
+    cut = i + cl - 1
+    i = i + cl
+  end
+  return text:sub(1, cut) .. "…"
+end
+
+local function task_title(task_id)
+  if task_id == MAIN_TASK then
+    return nil
+  end
+  local name = task_names[task_id]
+  if name == nil then
+    local ok, list = pcall(maki.task.list)
+    for _, row in ipairs(ok and list or {}) do
+      if row.id and row.name and row.name ~= "" then
+        task_names[row.id] = row.name
+      end
+    end
+    name = task_names[task_id]
+  end
+  return short_text(name or task_id, MAX_TASK_CELLS)
+end
+
+-- Rebuilt on every change: one line per bar, in creation order, all bars
+-- of a block at the same width so the columns line up. set_lines repaints
+-- the panel through its waker, set_config rows it to the line count.
+local function render()
+  local sid = focused.session
+  local ids = tasks_with_bars(sid)
+  if #ids == 0 then
     if win and win:is_open() then
       win:hide()
     end
@@ -244,10 +308,33 @@ local function render()
   end
 
   local now = os.time()
-  local widths = column_widths(list, now)
+  local titles, title_w = {}, 0
+  for i, task_id in ipairs(ids) do
+    titles[i] = task_title(task_id)
+    if titles[i] then
+      title_w = math.max(title_w, dw(titles[i]))
+    end
+  end
+  local left = title_w > 0 and title_w + 2 or 0
+
   local lines = {}
-  for i, st in ipairs(list) do
-    lines[i] = render_state(st, now, widths)[1]
+  for i, task_id in ipairs(ids) do
+    local list = bars_of({ session = sid, task = task_id })
+    local widths = column_widths(list, now)
+    for j, st in ipairs(list) do
+      local line = render_state(st, now, widths, left)[1]
+      if left > 0 then
+        local head = { { string.rep(" ", left), {} } }
+        if titles[i] and j == 1 then
+          head = { { pad_right(titles[i], title_w), "bold" }, { "  ", {} } }
+        end
+        for _, sp in ipairs(line) do
+          head[#head + 1] = sp
+        end
+        line = head
+      end
+      lines[#lines + 1] = line
+    end
   end
   buf:set_lines(lines)
   win:set_config({ height = #lines })
@@ -276,12 +363,6 @@ local function clear_state(key, name)
     task_bars[name] = nil
   else
     states[key.session][key.task] = nil
-  end
-  local fb = fallback[key.session]
-  if fb and fb.task == key.task and not bars_of(key) then
-    -- The fallback only dies with the last bar of its task: another bar
-    -- left in it still wants the screen.
-    fallback[key.session] = nil
   end
 end
 
@@ -362,7 +443,6 @@ local function apply(key, input)
     states[key.session][key.task] = states[key.session][key.task] or {}
     states[key.session][key.task][name] = st
   end
-  fallback[key.session] = { task = key.task }
   if restart then
     st.start_time = os.time()
     st.note = nil
@@ -416,6 +496,11 @@ Several bars at once (parallel work; one line each, stacked in creation order):
     await progress_bar(name='build', label='build', value=0, total=500)
     await progress_bar(name='check', label='check', value=0, total=200)
     await progress_bar(name='build', value=412)   # updates the build bar only
+
+Every task of the session shows its own block: the main chat's bars first,
+then each subagent's, the task's name left of its first bar. A bar a
+background task (Ctrl+B) or a running subagent left stays on screen while
+the user reads another chat.
 
 Rules:
 - A fresh bar needs `value` and `total` together. On later calls pass only what changed.
@@ -510,7 +595,7 @@ maki.api.create_autocmd("TurnStart", {
     -- for the turn that was live before it, so drop anything a restored
     -- state table left behind when the next turn starts.
     if states[ev.data.session_id] then
-      states[ev.data.session_id], fallback[ev.data.session_id] = nil, nil
+      states[ev.data.session_id] = nil
     end
   end,
 })
@@ -519,11 +604,22 @@ maki.api.create_autocmd("TurnStart", {
 maki.api.create_autocmd({ "TurnEnd", "SessionReset", "SessionEnd" }, {
   callback = function(ev)
     local sid = ev.data and ev.data.session_id or ""
-    if states[sid] or fallback[sid] then
-      states[sid], fallback[sid] = nil, nil
+    if states[sid] then
+      states[sid] = nil
     end
     if sid == focused.session then
       sync()
+    end
+  end,
+})
+
+-- A subagent's name labels its block; the event that announces the task
+-- also names it, so the render needs no extra roundtrip.
+maki.api.create_autocmd("TaskStatusChanged", {
+  callback = function(ev)
+    local d = ev.data or {}
+    if d.id and d.name and d.name ~= "" then
+      task_names[d.id] = d.name
     end
   end,
 })
@@ -548,6 +644,8 @@ return {
     MAX_BARS = MAX_BARS,
     sanitize = sanitize,
     to_count = to_count,
+    tasks_with_bars = tasks_with_bars,
+    short_text = short_text,
     auto_color = auto_color,
     percent = percent,
     render_state = render_state,
